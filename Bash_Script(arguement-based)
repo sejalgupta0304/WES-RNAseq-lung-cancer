@@ -1,0 +1,261 @@
+#!/bin/bash
+
+###############################################################################
+# ARGUEMENT BASED SCRIPT
+# Mouse Lung Tumor integrative analysis Project
+# WES + RNA-seq + Variant Calling + Annotation + Integration
+#
+# Author: Sejal Gupta
+#
+# Usage:
+# chmod +x pipeline.sh
+#
+# RNA-seq:
+# ./pipeline.sh rnaseq WT1
+#
+# WES Tumor-Normal:
+# ./pipeline.sh wes tumor1 normal1
+#
+# Integration:
+# ./pipeline.sh integrate
+###############################################################################
+
+set -e
+
+############################
+# CHECK ARGUMENTS
+############################
+
+if [ $# -lt 1 ]; then
+    echo "Usage:"
+    echo "./pipeline.sh rnaseq <sample>"
+    echo "./pipeline.sh wes <tumor_sample> <normal_sample>"
+    echo "./pipeline.sh integrate"
+    exit 1
+fi
+
+MODE=$1
+
+############################
+# THREADS
+############################
+
+THREADS=2
+
+############################
+# PROJECT PATHS
+############################
+
+BASE="/mnt/d/lung_project"
+RAW="$BASE/rawdata"
+REF="$BASE/reference"
+RESULTS="$BASE/results"
+LOGS="$BASE/logs"
+
+mkdir -p $RESULTS
+mkdir -p $LOGS
+
+############################
+# REFERENCE FILES
+############################
+
+FASTA="$REF/mm10.fa"
+HISAT_INDEX="$REF/mm10_index"
+GTF="$REF/genes.gtf"
+
+###############################################################################
+# RNA-SEQ MODE
+###############################################################################
+
+if [ "$MODE" = "rnaseq" ]; then
+
+    SAMPLE=$2
+
+    if [ -z "$SAMPLE" ]; then
+        echo "Usage: ./pipeline.sh rnaseq <sample>"
+        exit 1
+    fi
+
+    mkdir -p $RESULTS/rnaseq/{fastqc,trimmed,bam,counts}
+
+    R1="$RAW/$SAMPLE/${SAMPLE}_R1.fastq.gz"
+    R2="$RAW/$SAMPLE/${SAMPLE}_R2.fastq.gz"
+
+    echo "RNA-seq Processing: $SAMPLE"
+
+    # FastQC
+    fastqc $R1 $R2 -o $RESULTS/rnaseq/fastqc
+
+    # fastp
+    fastp \
+    -i $R1 \
+    -I $R2 \
+    -o $RESULTS/rnaseq/trimmed/${SAMPLE}_R1.trimmed.fastq.gz \
+    -O $RESULTS/rnaseq/trimmed/${SAMPLE}_R2.trimmed.fastq.gz \
+    --detect_adapter_for_pe \
+    --thread $THREADS \
+    --html $RESULTS/rnaseq/trimmed/${SAMPLE}.html \
+    --json $RESULTS/rnaseq/trimmed/${SAMPLE}.json
+
+    # HISAT2
+    hisat2 -p $THREADS --dta \
+    -x $HISAT_INDEX \
+    -1 $RESULTS/rnaseq/trimmed/${SAMPLE}_R1.trimmed.fastq.gz \
+    -2 $RESULTS/rnaseq/trimmed/${SAMPLE}_R2.trimmed.fastq.gz | \
+    samtools view -Sb - | \
+    samtools sort -o $RESULTS/rnaseq/bam/${SAMPLE}.sorted.bam
+
+    samtools index $RESULTS/rnaseq/bam/${SAMPLE}.sorted.bam
+
+    # featureCounts single sample
+    featureCounts \
+    -T $THREADS \
+    -p \
+    -a $GTF \
+    -o $RESULTS/rnaseq/counts/${SAMPLE}_counts.txt \
+    $RESULTS/rnaseq/bam/${SAMPLE}.sorted.bam
+
+    echo "RNA-seq Completed: $SAMPLE"
+fi
+
+###############################################################################
+# WES MODE
+###############################################################################
+
+if [ "$MODE" = "wes" ]; then
+
+    TUMOR=$2
+    NORMAL=$3
+
+    if [ -z "$TUMOR" ] || [ -z "$NORMAL" ]; then
+        echo "Usage: ./pipeline.sh wes <tumor_sample> <normal_sample>"
+        exit 1
+    fi
+
+    mkdir -p $RESULTS/wes/{bam,vcf,annotated,metrics}
+
+    T_R1="$RAW/$TUMOR/${TUMOR}_R1.fastq.gz"
+    T_R2="$RAW/$TUMOR/${TUMOR}_R2.fastq.gz"
+
+    N_R1="$RAW/$NORMAL/${NORMAL}_R1.fastq.gz"
+    N_R2="$RAW/$NORMAL/${NORMAL}_R2.fastq.gz"
+
+    echo "WES Tumor: $TUMOR  Normal: $NORMAL"
+
+    ########################################
+    # ALIGN TUMOR
+    ########################################
+    bwa mem -t $THREADS $FASTA $T_R1 $T_R2 | \
+    samtools view -Sb - | \
+    samtools sort -o $RESULTS/wes/bam/${TUMOR}.sorted.bam
+
+    samtools index $RESULTS/wes/bam/${TUMOR}.sorted.bam
+
+    ########################################
+    # ALIGN NORMAL
+    ########################################
+    bwa mem -t $THREADS $FASTA $N_R1 $N_R2 | \
+    samtools view -Sb - | \
+    samtools sort -o $RESULTS/wes/bam/${NORMAL}.sorted.bam
+
+    samtools index $RESULTS/wes/bam/${NORMAL}.sorted.bam
+
+    ########################################
+    # MARK DUPLICATES
+    ########################################
+    picard MarkDuplicates \
+    I=$RESULTS/wes/bam/${TUMOR}.sorted.bam \
+    O=$RESULTS/wes/bam/${TUMOR}.markdup.bam \
+    M=$RESULTS/wes/metrics/${TUMOR}.txt
+
+    picard MarkDuplicates \
+    I=$RESULTS/wes/bam/${NORMAL}.sorted.bam \
+    O=$RESULTS/wes/bam/${NORMAL}.markdup.bam \
+    M=$RESULTS/wes/metrics/${NORMAL}.txt
+
+    samtools index $RESULTS/wes/bam/${TUMOR}.markdup.bam
+    samtools index $RESULTS/wes/bam/${NORMAL}.markdup.bam
+
+    ########################################
+    # MUTECT2
+    ########################################
+    gatk Mutect2 \
+    -R $FASTA \
+    -I $RESULTS/wes/bam/${TUMOR}.markdup.bam \
+    -I $RESULTS/wes/bam/${NORMAL}.markdup.bam \
+    -tumor $TUMOR \
+    -normal $NORMAL \
+    -O $RESULTS/wes/vcf/${TUMOR}.raw.vcf
+
+    ########################################
+    # FILTER
+    ########################################
+    gatk FilterMutectCalls \
+    -V $RESULTS/wes/vcf/${TUMOR}.raw.vcf \
+    -O $RESULTS/wes/vcf/${TUMOR}.filtered.vcf
+
+    ########################################
+    # PASS ONLY
+    ########################################
+    bcftools view -f PASS \
+    $RESULTS/wes/vcf/${TUMOR}.filtered.vcf \
+    -o $RESULTS/wes/vcf/${TUMOR}.pass.vcf
+
+    ########################################
+    # VEP ANNOTATION
+    ########################################
+    vep \
+    -i $RESULTS/wes/vcf/${TUMOR}.pass.vcf \
+    -o $RESULTS/wes/annotated/${TUMOR}.annotated.vcf \
+    --cache \
+    --offline \
+    --species mus_musculus \
+    --assembly GRCm38
+
+    ########################################
+    # FUNCTIONAL VARIANTS
+    ########################################
+    grep -Ei "missense_variant|frameshift_variant|stop_gained|splice" \
+    $RESULTS/wes/annotated/${TUMOR}.annotated.vcf \
+    > $RESULTS/wes/annotated/${TUMOR}.functional.vcf
+
+    echo "WES Completed: $TUMOR vs $NORMAL"
+fi
+
+###############################################################################
+# INTEGRATION MODE
+###############################################################################
+
+if [ "$MODE" = "integrate" ]; then
+
+    mkdir -p $RESULTS/integration
+
+    echo "Integrating Mutated Genes + DEGs"
+
+    # Example files
+    # mutated_genes.txt from WES
+    # significant_genes.csv from RNA-seq
+
+    cut -f1 $RESULTS/wes/annotated/*.functional.vcf | sort | uniq \
+    > $RESULTS/integration/mutated_genes.txt || true
+
+    cut -d',' -f1 $RESULTS/rnaseq/counts/*.txt | sort | uniq \
+    > $RESULTS/integration/rnaseq_genes.txt || true
+
+    comm -12 \
+    $RESULTS/integration/mutated_genes.txt \
+    $RESULTS/integration/rnaseq_genes.txt \
+    > $RESULTS/integration/integrated_genes.txt || true
+
+    echo "Integration Completed"
+fi
+
+###############################################################################
+# END
+###############################################################################
+
+echo "=================================================="
+echo " Pipeline Finished Successfully"
+echo "Mode: $MODE"
+echo "Output Directory: $RESULTS"
+echo "=================================================="
